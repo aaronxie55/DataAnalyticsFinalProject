@@ -1,0 +1,403 @@
+#Code for LSTM
+# Importing the libraries
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+import tensorflow as tf
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.layers import LSTM
+from keras.layers import Dropout
+from sklearn.preprocessing import MinMaxScaler
+from keras.models import load_model
+from keras.callbacks import EarlyStopping
+from keras.callbacks import ModelCheckpoint
+import itertools
+import math
+
+#Read the file
+data = pd.read_csv('./input/prices.csv', header=0)
+print(data.columns)
+print(data.shape)
+#Get symbols of data
+symbols = data['symbol'].unique()
+data['symbol'].describe()
+
+#Choose one stock to predit, Here we use GOOGL as example
+choosen_symbol = 'GOOGL'
+print(choosen_symbol)
+data_stock = data[data['symbol'] == choosen_symbol].reset_index(drop = True)
+data_stock.iloc[:10, :]
+#drop of column date and symbol
+data_stock = data_stock.drop(['date', 'symbol'], axis=1)
+data_stock.head()
+#drop of column date and symbol
+data_stock = data_stock.drop(['open', 'low', 'high'], axis=1)
+data_stock.head()
+
+#Normailize data
+scaled = MinMaxScaler(feature_range=(0, 1))
+data_stock_scaled = scaled.fit_transform(data_stock)
+data_stock_scaled.view()
+
+#Create test and train set
+def create_set(df, n_future, n_past, train_test_percent, validation_percent):
+    n_feature = df.shape[1]
+    x_data = []
+    y_data = []
+    
+    for i in range(n_past, len(df) - n_future + 1):
+        x_data.append(df[i - n_past:i, 0:n_feature])
+        y_data.append(df[i + n_future - 1:i + n_future, 0])
+    
+    test_split = int(round(train_test_percent*len(x_data)))
+    train_split = int(round(test_split*(1-validation_percent)))
+    #using validation_split for validation set in fit function.
+    x_train = x_data[:train_split]
+    y_train = y_data[:train_split]
+    x_test = x_data[test_split:]
+    y_test = y_data[test_split:]
+    
+    return np.array(x_train), np.array(x_test), np.array(y_train), np.array(y_test)
+# 80 : 20 train and test set
+X_train, X_test, y_train, y_test = create_set(data_stock_scaled, n_future=1, 
+    n_past=25, train_test_percent=0.8, validation_percent = 0)
+print(X_train.shape)
+print(X_test.shape)
+print(y_train.shape)
+print(y_test.shape)
+
+
+#LSTM Hyperparameter tuning
+def LSTM_Tuning(config, x_train, y_train, x_test, y_test):
+    
+    #get value from config
+    additional_layer,n_neurons, n_batch_size, dropout = config
+    #create combinations
+    _combinations = list(itertools.product(additional_layer, n_neurons, n_batch_size, dropout)) 
+    print(_combinations)
+    print('\n')
+    
+    result = []
+    
+    for i in range(0, len(_combinations)):
+        
+        print(f'{i}th combination: \n')
+        print('--------------------------------------------------------------------')
+        
+        additional_layer, n_neurons, n_batch_size, dropout = _combinations[i]
+        
+        # instantiating the model in the strategy scope creates the model on the TPU
+        #with tpu_strategy.scope():
+        module = Sequential()
+        module.add(LSTM(units=n_neurons, return_sequences=True, input_shape=(x_train.shape[1], x_train.shape[2])))
+        module.add(Dropout(dropout))
+
+        if additional_layer:
+            module.add(LSTM(units=n_neurons, return_sequences=True))
+            module.add(Dropout(dropout))
+
+        module.add(LSTM(units=n_neurons, return_sequences=False))
+        module.add(Dropout(dropout))
+        module.add(Dense(units=1, activation='linear'))
+        module.compile(optimizer='adam', loss='mse')
+
+        #early stopping condition
+        es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=20)
+
+        #store check point for best model
+        file_path = 'best.h5'
+        mc = ModelCheckpoint(file_path, monitor='val_loss', mode='min', verbose=1, save_best_only=True)
+
+        module.fit(x_train, y_train, validation_split=0.3, epochs=1000, batch_size=n_batch_size, callbacks=[es, mc], verbose=0)
+        trainScore = module.evaluate(x_train, y_train, verbose=0)
+        testScore = module.evaluate(x_test, y_test, verbose=0)
+
+        result.append(list((additional_layer,  n_neurons, n_batch_size, dropout, trainScore, testScore)))
+
+        print(f'{str(i)}th combination = {_combinations[i]} \n train Score: {trainScore} and test Score: {testScore}')
+        
+        print('--------------------------------------------------------------------')
+        print('--------------------------------------------------------------------') 
+    return result
+
+config = [[False, True], [128, 256], [32, 64, 128], [0.1, 0.2, 0.3]]  
+# file for the combinatin set[additional_layer], [n_neurons], [n_batch_size], [dropout]]
+# Apply tuning
+result = LSTM_Tuning(config, X_train, y_train, X_test, y_test)
+
+#Sort result looking for best test result
+result = pd.DataFrame(result)
+result = result.sort_values(by=[5], ascending=True)
+result
+print(f'Result: \n  layer = {result.iloc[0, 0]}\n  neurons = {result.iloc[0, 1]}\n batch = {result.iloc[0, 2]}\n dropout = {result.iloc[0, 3]}')
+additional_layer, n_neurons, n_batch_size, dropout = list(result.iloc[0, :-2])
+
+#build model
+model = Sequential()
+model.add(LSTM(units=n_neurons, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])))
+model.add(Dropout(dropout))
+
+if additional_layer:
+    model.add(LSTM(units=n_neurons, return_sequences=True))
+    model.add(Dropout(dropout))
+
+model.add(LSTM(units=n_neurons, return_sequences=False))
+model.add(Dropout(dropout))
+model.add(Dense(units=1, activation='linear'))
+model.compile(optimizer='adam', loss='mse')
+
+es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=20)
+
+file_path = 'best.h5'
+
+mc = ModelCheckpoint(file_path, monitor='val_loss', mode='min', verbose=1, save_best_only=True)
+
+model.fit(X_train, y_train, validation_split=0.3, epochs=1000, batch_size=n_batch_size, callbacks=[es, mc], verbose=0)
+
+#Show score
+testScore = model.evaluate(X_test, y_test)
+trainScore = model.evaluate(X_train, y_train)
+print('Train Score: %.5f MSE (%.2f RMSE)' % (trainScore, math.sqrt(trainScore)))
+print('Test Score: %.5f MSE (%.2f RMSE)' % (testScore, math.sqrt(testScore)))
+
+y_pred = model.predict(X_test)
+
+#Plotting out result
+plt.figure(figsize=(16,8))
+
+plt.plot(y_test, label = 'Real Closing Price')
+plt.plot(y_pred, label = 'Predicted Closing Price')
+plt.xlabel('time [days]')
+plt.ylabel('normalized price')
+plt.legend(loc='best')
+
+
+
+
+#Code for KNN regression
+#import the required libraries
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from sklearn import metrics
+from sklearn.preprocessing import MinMaxScaler
+from sklearn import neighbors
+import math
+#read data into dataframe
+data =  pd.read_csv(r"file:///C:\Users\lixin\OneDrive\Desktop\prices.csv")
+#change column
+google = data[data['symbol']=='GOOGL']
+apple = data[data['symbol']=='AAPL']
+yahoo = data[data['symbol']=='YHOO']
+google = google.assign(day=range(google.shape[0]))
+apple = apple.assign(day=range(apple.shape[0]))
+yahoo = yahoo.assign(day=range(yahoo.shape[0]))
+print(google.head)
+#data visualization
+plt.plot(google.day, google.close)
+plt.xlabel('Day')
+plt.ylabel('Price')
+plt.show()
+plt.plot(apple.day, apple.close)
+plt.xlabel('Day')
+plt.ylabel('Price')
+plt.show()
+plt.plot(yahoo.day, yahoo.close)
+plt.xlabel('Day')
+plt.ylabel('Price')
+plt.show()
+
+scaler = MinMaxScaler()
+#split data into train and test sets
+Y = yahoo["close"].values.reshape(-1, 1)
+X = yahoo["day"].values.reshape(-1, 1)
+Y = scaler.fit_transform(Y)
+train_X, test_X, train_Y, test_Y = train_test_split(X, Y, test_size = 0.2)
+
+#apply KNN model
+n = []
+scores = []
+preds_Y_list = []
+MSE = []
+RMSE = []
+for i in range(1,50):
+    n.append(i)
+    knn = neighbors.KNeighborsRegressor(n_neighbors = i)
+    knn.fit(train_X, train_Y) 
+    preds_Y = knn.predict(test_X)
+    scores.append(knn.score(preds_Y, test_Y))
+    if len(scores)>=2 and scores[-1]>scores[-2]:
+        preds_Y_list.append(preds_Y)
+    MSE.append(metrics.mean_squared_error(test_Y, preds_Y))
+    RMSE.append(math.sqrt(metrics.mean_squared_error(test_Y, preds_Y)))
+
+    
+#plot accuracy
+lowest_mse = n[MSE.index(min(MSE))]
+lowest_rmse = n[RMSE.index(min(RMSE))]
+plt.plot(n, MSE)
+plt.xlabel('Number of neighbors')
+plt.ylabel('MSE')
+plt.show()
+print(f"Lowest MSE:{min(MSE)} at {lowest_mse}")
+plt.plot(n, RMSE)
+plt.xlabel('Number of neighbors')
+plt.ylabel('RMSE')
+plt.show()
+print(f"Lowest RMSE:{min(RMSE)} at {lowest_rmse}")
+#plot best case with future stock price predictions (10 days:1762-1772)
+print("\nBest case with future stock price predictions:")
+plt.plot(test_X, test_Y, ".", label="Actual values")
+size = google.shape[0]
+future_X = []
+for i in range(size, size+10):
+    future_X = np.append(future_X, i)
+future_X = future_X.reshape(-1,1)
+knn = neighbors.KNeighborsRegressor(n_neighbors = lowest_rmse)
+knn.fit(train_X, train_Y) 
+preds_Y = knn.predict(test_X)
+future_Y = knn.predict(future_X)
+plt.plot(test_X, preds_Y, "r.", label="Predicted values")
+plt.plot(future_X, future_Y, "y.", label="Future values")
+plt.legend()
+plt.show()
+
+
+
+#code for SARIMA
+import warnings
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.pylab import rcParams
+from sklearn.preprocessing import MinMaxScaler
+from pmdarima.arima import auto_arima
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import statsmodels.api as sm
+ 
+ 
+rcParams['figure.figsize'] = 8, 5
+warnings.filterwarnings('ignore')
+ 
+ 
+prices_split_adjusted = pd.read_csv('prices-split-adjusted.csv',index_col='date', parse_dates=['date'])
+ 
+symbol = pd.DataFrame(prices_split_adjusted['symbol'].value_counts())
+omit = symbol[symbol['symbol'] < 1762].index
+prices_split_adjusted = prices_split_adjusted[~prices_split_adjusted['symbol'].isin(omit)]
+ 
+ 
+stock_name = 'AAPL'
+#stock_name = 'YHOO'
+#stock_name = 'GOOGL'
+ 
+stock = prices_split_adjusted[prices_split_adjusted['symbol'] == stock_name]
+ 
+ 
+apple = stock.copy()
+apple_m2 = apple.copy()
+apple_m2['mean'] = (apple_m2['low'] + apple_m2['high'])/2
+ 
+steps = -1
+apple_m2['actual']=apple_m2['mean'].shift(steps)
+apple_m2.dropna(inplace=True)
+ 
+sc_in = MinMaxScaler(feature_range=(0, 1))
+scaled_input = sc_in.fit_transform(apple_m2[['low', 'high','open', 'close', 'volume']])
+X = pd.DataFrame(scaled_input)
+ 
+sc_out = MinMaxScaler(feature_range=(0, 1))
+scaler_output = sc_out.fit_transform(apple_m2['actual'].values.reshape(-1,1))
+y = pd.DataFrame(scaler_output)
+ 
+ 
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+ 
+#plt.rcParams.update({'figure.figsize': (12,8)})
+multiplicative = sm.tsa.seasonal_decompose(stock["close"].to_frame(),freq=360,model='multiplicative')
+multiplicative.plot().suptitle('Multiplicative Decompose', fontsize=12)
+#plt.show()
+ 
+#Seasonal Autocorrelation
+amzn_seasonal = multiplicative.seasonal
+ 
+#acf
+#plot_acf(amzn_seasonal.resample(rule='W').mean(),alpha=0.05,lags=25)
+#plt.show()
+ 
+#plot_pacf(amzn_seasonal.resample(rule='W').mean(),alpha=0.05,lags=25)
+#plt.show()
+ 
+split_size = 0.8
+train_size=int(len(apple['close']) * split_size)
+test_size = int(len(apple['close'])) - train_size
+train_X, train_y = X[:train_size], y[:train_size]
+test_X, test_y = X[train_size:], y[train_size:]
+ 
+step_wise = auto_arima(train_y, exogenous= train_X,
+                   	start_p=1, start_q=1,
+                   	max_p=12, max_q=12, d=1, max_d=10,
+                   	trace=True, error_action='ignore',
+                   	suppress_warnings=True, stepwise=True) #seasonal=True/ trend='c'
+ 
+ 
+ 
+#d=7 only 7th order differencing
+model = SARIMAX(train_y, exog=train_X[3],
+            	order=(1,1,3),
+            	seasonal_order=(1,0,0,12),
+            	seasonal=True,
+            	enforce_invertibility=False,
+            	enforce_stationarity=False)
+ 
+sarimax_results = model.fit()
+predictions = sarimax_results.predict(start=train_size, end=train_size+test_size-2, exog=test_X[3])
+forecast = sarimax_results.forecast(steps=test_size-1, exog=test_X[3])
+ 
+ 
+from statsmodels.tools.eval_measures import rmse
+error=rmse(predictions.values, test_y[0].values)
+print('rmse is ' + str(error))
+ 
+fig4 = plt.figure(figsize=(8,5))
+ax5 = plt.plot(apple.index[0:-1],X[2])
+ 
+prediction_start_index = apple.index[train_size-1]+pd.DateOffset(weeks=0)
+prediction_end_index = apple.index[train_size-1]+pd.DateOffset(weeks=52)
+ 
+print("startt :: " + str(prediction_start_index))
+ 
+print("end :: " + str(prediction_end_index))
+ 
+ 
+test_predictions = sarimax_results.predict(start=train_size, end=train_size+test_size-2, exog=test_X[3])
+ax5 = plt.plot(apple.index[train_size:train_size+test_size-1],test_predictions.values,color="orange", label="test")
+ 
+prediction_index = pd.date_range(start=prediction_start_index,end=prediction_end_index,freq="W")
+predictions = sarimax_results.forecast(steps=52, exog=test_X[3][0:52])
+fcast = sarimax_results.get_forecast(52,exog=test_X[3][0:52])
+confidence_intervals = fcast.conf_int()
+ 
+print("length ::" + str(len(predictions)))
+ 
+pred = pd.DataFrame({'predicted':predictions.values,
+                 	'lower':confidence_intervals['lower y'].values,
+                 	'upper':confidence_intervals['upper y'].values},
+                	index=prediction_index)
+ 
+ax5 = plt.plot(pred.index,pred['predicted'],color="green",label='predictions')
+ 
+plt.fill_between(pred.index,pred['lower'],pred['upper'],color="#CECECE",label='Confidence Interval')
+rcParams["legend.loc"] = 'lower right'
+plt.legend()
+plt.show()
+ 
+ 
+print(" MSE: " +
+  	str(mean_squared_error(test_y,test_predictions.values)))
+ 
+print(" MAE: " +
+  	str(mean_absolute_error(test_y,test_predictions.values)))
